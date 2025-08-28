@@ -141,43 +141,57 @@ bayes.makeModel <- function(k.gas){
 # ================================
 # = Supply Data and run bayesFit =
 # ================================
-bayesFit <- function(data, params, mf, tend="median", ...){ #function that writes jags model, traces params, supplies data, etc
-
-	bf.args <- list(...)
-
-	jags.m <- R2jags::jags(data, NULL, parameters.to.save=params, mf)
-
-	tF <- function(x, tend){ # tendency function
-		switch(tend,
-			median=median(x), #median
-			mean=mean(x), #mean
-			mode1 = unique(x)[which.max(tabulate(match(x, unique(x))))], # mode --- most frequently observed value
-			mode2 = { # mode --- based on the highest peak of the posterior probability (from density plot)
-				xd <- density(x)
-				xd$x[which.max(xd$y)]
-			}
-			)
-	}
-	# medSim <- matrix(apply(jags2.m$BUGSoutput$sims.matrix, 2, median)[-(1)], nrow=115, ncol=3)
-	simOut <- jags.m$BUGSoutput$sims.matrix
-	ctSim <- apply(simOut, 2, tF, tend) # the central tendency metric
-	sdSim <- apply(simOut, 2, sd)
-
-	#Figure out the order of the sims.matrix columns ...
-	n.obs <- length(data$U[,1])
-	GPP <- mean(ctSim[1]*data$U[,1], na.rm=TRUE) * n.obs # gpp coef * par, then sum
-	R <- mean(ctSim[2]*data$U[,2], na.rm=TRUE) * n.obs # r coef * log(temp), then sum
-
-	GPPsd <- sqrt(sum(sdSim[1]^2*data$U[,1]^2))
-	Rsd <- sqrt(sum(sdSim[2]^2*data$U[,2]^2))
-	NEPsd <- sqrt(GPPsd^2 + Rsd^2)
-
-	return(list(
-		"model" = jags.m,
-		"params" = ctSim[1:2],
-		"metab.sd" = matrix(c(GPPsd, Rsd, NEPsd), nrow=1, dimnames=list(NULL, c("GPPsd", "Rsd", "NEPsd"))),
-		"metab" = matrix(c(GPP, R, GPP+R), nrow=1, dimnames=list(NULL, c("GPP", "R", "NEP")))
-	)) # need to clean up format, and maybe include a return of the sd's of the estimates
+bayesFit <- function (data, params, mf, tend = "median", freq, ...) #function that writes jags model, traces params, supplies data, etc
+{
+  bf.args <- list(...)
+  jags.m <- R2jags::jags(data, NULL, parameters.to.save = params, mf)
+  tF <- function(x, tend) {
+    switch(
+      tend,
+      median = median(x),
+      mean = mean(x),
+      mode1 = unique(x)[which.max(tabulate(match(x, unique(x))))],
+      mode2 = {
+        xd <- density(x)
+        xd$x[which.max(xd$y)]
+      }
+    )
+  }
+  simOut <- jags.m$BUGSoutput$sims.matrix
+  ctSim <- apply(simOut, 2, tF, tend)
+  sdSim <- apply(simOut, 2, sd, na.rm = TRUE)
+  n.obs <- length(data$U[, 1])
+  GPP <- mean(ctSim[1] * data$U[, 1], na.rm = TRUE) * n.obs
+  R <- mean(ctSim[2] * data$U[, 2], na.rm = TRUE) * n.obs
+  GPPsd <- sqrt(sum(sdSim[1]^2 * data$U[, 1]^2))
+  Rsd <- sqrt(sum(sdSim[2]^2 * data$U[, 2]^2))
+  NEPsd <- sqrt(GPPsd^2 + Rsd^2)
+  K_cols <- grep("^K\\[", colnames(simOut), value = TRUE)
+  if (length(K_cols) > 0) {
+    K_vec <- apply(simOut[, K_cols, drop = FALSE], 2, tF, tend)
+    Ksd_vec <- apply(simOut[, K_cols, drop = FALSE], 2, sd, na.rm = TRUE)
+    scale_factor <- 1440 / freq
+    K <- mean(K_vec) * scale_factor
+    Ksd <- mean(Ksd_vec) * scale_factor
+  }
+  else {
+    K <- NA
+    Ksd <- NA
+  }
+  return(list(
+    model = jags.m,
+    params = c(ctSim[1:2], K = K),
+    metab.sd = matrix(
+      c(GPPsd, Rsd, NEPsd, Ksd),
+      nrow = 1,
+      dimnames = list(NULL, c("GPPsd", "Rsd", "NEPsd", "Ksd"))
+    ),
+    metab = matrix(
+      c(GPP, R, GPP + R, K),
+      nrow = 1,
+      dimnames = list(NULL, c("GPP", "R", "NEP", "K"))
+    )
+  ))
 }
 
 #'@title Metabolism model based on a bayesian parameter estimation framework
@@ -203,7 +217,11 @@ bayesFit <- function(data, params, mf, tend="median", ...){ #function that write
 		#' \item{\code{GPP}}{numeric estimate of Gross Primary Production, \eqn{mg O_2 L^{-1} d^{-1}}{mg O2 / L / d}}
 		#' \item{\code{R}}{numeric estimate of Respiration, \eqn{mg O_2 L^{-1} d^{-1}}{mg O2 / L / d}}
 		#' \item{\code{NEP}}{numeric estimate of Net Ecosystem production, \eqn{mg O_2 L^{-1} d^{-1}}{mg O2 / L / d}}
+		#' \item{\code{K}}{numeric estimate of gas exchange coefficient, \eqn{day^-1}}
 	#' }}
+#' @note
+#' This version of metab.bayesian() extends the original by including estimates of K (gas exchange coefficient) 
+#' and its uncertainty (Ksd) in addition to GPP and R.
 
 
 #'@references
@@ -247,99 +265,93 @@ bayesFit <- function(data, params, mf, tend="median", ...){ #function that write
 #'               k.gas=k.gas, do.obs=doobs[,2])
 #'}
 #'@export
-metab.bayesian <- function(do.obs, do.sat, k.gas, z.mix, irr, wtr, priors, ...){
-
-  complete.inputs(do.obs=do.obs, do.sat=do.sat, k.gas=k.gas,
-                  z.mix=z.mix, irr=irr, wtr=wtr, error=TRUE)
-
-  if(any(z.mix <= 0)){
-		stop("z.mix must be greater than zero.")
-	}
-	if(any(wtr <= 0)){
-		stop("all wtr must be positive.")
-	}
-
-	mb.args <- list(...)
-	nobs <- length(do.obs)
-	# =========================================
-	# = Check for datetime and claculate freq =
-	# =========================================
-	if("datetime"%in%names(mb.args)){ # check to see if datetime is in the ... args
-		datetime <- mb.args$datetime # extract datetime
-		freq <- calc.freq(datetime) # calculate sampling frequency from datetime
-		if(nobs!=freq){ # nobs and freq should agree, if they don't issue a warning
-			bad.date <- format.Date(datetime[1], format="%Y-%m-%d")
-			warning("number of observations on ", bad.date, " (", nobs, ") ", "does not equal estimated sampling frequency", " (", freq, ")", sep="")
-		}
-	}else{ # if datetime is *not* in the ... args
-		warning("datetime not found, inferring sampling frequency from # of observations") # issue a warning (note checks in addNAs)
-		# NOTE: because of the checks in addNA's, it is unlikely a user would receive this warning via metab()
-		# warning will only be seen through direct use of metab.bookkeep when datettime is not supplied
-		freq <- nobs
-	}
-
-	# ======================================
-	# = # Check for priors supplied in ... =
-	# ======================================
-	if(!missing(priors)){
-		t.priors <- priors
-		p.name.logic <- all(c(c("gppMu", "gppSig2", "rMu", "rSig2", "kSig2"))%in%names(t.priors))
-		p.class.logic <- is.integer(t.priors) | is.numeric(t.priors)
-		if(p.name.logic & p.class.logic){
-			priors <- t.priors
-		}else{
-			stop("supplied priors was not a (properly) named numeric/integer vector")
-		}
-	}else{
-		priors <- c("gppMu"=0, "gppSig2"=1E5, "rMu"=0, "rSig2"=1E5, "kSig2"=NA)
-	}
-
-	if(!all(c(is.numeric(do.obs), is.numeric(do.sat), is.numeric(k.gas), is.numeric(z.mix), is.numeric(irr), is.numeric(wtr)))){
-		stop('All inputs to metab.bayes must be numeric vectors')
-	}
-
+metab.bayesian <- function (do.obs, do.sat, k.gas, z.mix, irr, wtr, priors, ...) 
+{
+  complete.inputs(do.obs = do.obs, do.sat = do.sat, k.gas = k.gas, 
+                  z.mix = z.mix, irr = irr, wtr = wtr, error = TRUE)
+  if (any(z.mix <= 0)) {
+    stop("z.mix must be greater than zero.")
+  }
+  if (any(wtr <= 0)) {
+    stop("all wtr must be positive.")
+  }
+  mb.args <- list(...)
+  nobs <- length(do.obs)
+  # =========================================
+  # = Check for datetime and calculate freq =
+  # =========================================
+  if ("datetime" %in% names(mb.args)) { # check to see if datetime is in the ... args
+    datetime <- mb.args$datetime # extract datetime
+    freq <- calc.freq(datetime) # calculate sampling frequency from datetime
+    if (nobs != freq) { # nobs and freq should agree, if they don't issue a warning
+      bad.date <- format.Date(datetime[1], format = "%Y-%m-%d")
+      warning("number of observations on ", bad.date, 
+              " (", nobs, ") ", "does not equal estimated sampling frequency", 
+              " (", freq, ")", sep = "")
+    }
+  }
+  else { # if datetime is *not* in the ... args
+    warning("datetime not found, inferring sampling frequency from # of observations")
+    freq <- nobs
+  }
+  # ======================================
+  # = # Check for priors supplied in ... =
+  # ======================================
+  if (!missing(priors)) {
+    t.priors <- priors
+    p.name.logic <- all(c(c("gppMu", "gppSig2", "rMu", "rSig2", 
+                            "kSig2")) %in% names(t.priors))
+    p.class.logic <- is.integer(t.priors) | is.numeric(t.priors)
+    if (p.name.logic & p.class.logic) {
+      priors <- t.priors
+    }
+    else {
+      stop("supplied priors was not a (properly) named numeric/integer vector")
+    }
+  }
+  else {
+    priors <- c(gppMu = 0, gppSig2 = 1e+05, rMu = 0, rSig2 = 1e+05, 
+                kSig2 = NA)
+  }
+  if (!all(c(is.numeric(do.obs), is.numeric(do.sat), is.numeric(k.gas), 
+             is.numeric(z.mix), is.numeric(irr), is.numeric(wtr)))) {
+    stop("All inputs to metab.bayes must be numeric vectors")
+  }
   requireNamespace("R2jags")
-
-	# Define model and write to file
-	# Model choice depends on k values (all 0, all non-0, mixture)
-	modfile <- bayes.makeModel(k.gas=(k.gas/freq))
-
-	# ===========================================
-	# = Define objects to be used in jags model =
-	# ===========================================
-	#Supply elements of U (PAR, log(temp))
-	U <- matrix(NA, nrow=length(irr), ncol=2)
-	U[,1] <- irr # PAR Values
-	U[,2] <- log(wtr) # log(temp) values
-
-	# Priors (kP) for k.gas
-	kP <- matrix(NA, nrow=length(k.gas), ncol=2)
-	# variances for K
-	kP[,1] <- k.gas/freq # means for K, adjusted to sampling frequency (velocity denominator in time step, not day)
-	if(is.na(priors["kSig2"])){
-		k0.logic <- !is.finite(1/kP[,1]) # test for when k is 0
-		kP[,2] <- sum(kP[,1])/sum(!k0.logic)*0.1 # k variance = mean of the non-zero K, times 0.1
-		kP[k0.logic,2] <- 1E-9
-	}else{
-		kP[,2] <- priors["kSig2"]
-	}
-
-	# Priors for regression coefficients (cP)
-	cP <- matrix(NA, nrow=2, ncol=2)
-	cP[1,1] <- priors["gppMu"] # prior mean of GPP coefficient (C[1,1]*PAR=GPP)
-	cP[1,2] <- priors["gppSig2"] # prior variance of GPP coefficient
-	cP[2,1] <- priors["rMu"] # prior mean of R coefficient (C[2,1]*log(Temp)=R)
-	cP[2,2] <- priors["rSig2"] # prior variance of R coefficient
-
-
-	# Put in final format supplied to jags
-	data <- list(Y=do.obs, N=length(do.obs), U=U, kP=kP, cP=cP, satO=do.sat, a0=do.obs[1], Zmix=z.mix)
-	params <- c("C", "sigmaV", "sigmaW")
-
-	output <- bayesFit(data, params, mf=modfile)
-	return(output)
-
+  
+  # Define model and write to file
+  # Model choice depends on k values (all 0, all non-0, mixture)
+  modfile <- bayes.makeModel(k.gas = (k.gas/freq))
+  
+  # ===========================================
+  # = Define objects to be used in jags model =
+  # ===========================================
+  #Supply elements of U (PAR, log(temp))
+  U <- matrix(NA, nrow = length(irr), ncol = 2)
+  U[, 1] <- irr
+  U[, 2] <- log(wtr)
+  kP <- matrix(NA, nrow = length(k.gas), ncol = 2)
+  kP[, 1] <- k.gas/freq
+  if (is.na(priors["kSig2"])) {
+    k0.logic <- !is.finite(1/kP[, 1])
+    kP[, 2] <- sum(kP[, 1])/sum(!k0.logic) * 0.1
+    kP[k0.logic, 2] <- 1e-09
+  }
+  else {
+    kP[, 2] <- priors["kSig2"]
+  }
+  cP <- matrix(NA, nrow = 2, ncol = 2)
+  cP[1, 1] <- priors["gppMu"] # prior mean of GPP coefficient (C[1,1]*PAR=GPP)
+  cP[1, 2] <- priors["gppSig2"] # prior variance of GPP coefficient
+  cP[2, 1] <- priors["rMu"] # prior mean of R coefficient (C[2,1]*log(Temp)=R)
+  cP[2, 2] <- priors["rSig2"] # prior variance of R coefficient
+  data <- list(Y = do.obs, N = length(do.obs), U = U, kP = kP, 
+               cP = cP, satO = do.sat, a0 = do.obs[1], Zmix = z.mix)
+  params <- c("C", "sigmaV", "sigmaW", "K")
+  output <- bayesFit(data, params, mf = modfile, freq = freq)
+  return(output)
 }
+
 
 
 
